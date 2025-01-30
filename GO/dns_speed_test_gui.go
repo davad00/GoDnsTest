@@ -11,6 +11,9 @@ import (
 	"strings"
 	"encoding/csv"
 	"os"
+	"path/filepath"
+	"os/exec"
+	"runtime"
 
 	"gioui.org/app"
 	"gioui.org/io/system"
@@ -63,6 +66,13 @@ type UI struct {
 	showConfig     bool
 	testHistory    [][]TestResult
 	errorLog       []string
+	decreaseTests  widget.Clickable
+	increaseTests  widget.Clickable
+	decreaseTimeout widget.Clickable
+	increaseTimeout widget.Clickable
+	useTCPCheckbox widget.Bool
+	useIPv6Checkbox widget.Bool
+	parallelCheckbox widget.Bool
 }
 
 var (
@@ -104,10 +114,14 @@ func main() {
 			config: TestConfig{
 				TestsPerDomain: 3,
 				Timeout:        3 * time.Second,
-				UseTCP:         false,
-				UseIPv6:        false,
-				ParallelTests:  true,
+				UseTCP:        false,
+				UseIPv6:       false,
+				ParallelTests: true,
 			},
+			// Initialize configuration controls
+			useTCPCheckbox:    widget.Bool{Value: false},
+			useIPv6Checkbox:   widget.Bool{Value: false},
+			parallelCheckbox:  widget.Bool{Value: true},
 		}
 		ui.tabs.Value = "test"
 		ui.status = "Ready to test DNS servers"
@@ -283,10 +297,9 @@ func (ui *UI) layoutConfig(gtx layout.Context) layout.Dimensions {
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							decreaseButton := widget.Clickable{}
-							btn := material.Button(ui.theme, &decreaseButton, "-")
+							btn := material.Button(ui.theme, &ui.decreaseTests, "-")
 							dims := btn.Layout(gtx)
-							if decreaseButton.Clicked() {
+							if ui.decreaseTests.Clicked() {
 								if ui.config.TestsPerDomain > 1 {
 									ui.config.TestsPerDomain--
 								}
@@ -295,10 +308,9 @@ func (ui *UI) layoutConfig(gtx layout.Context) layout.Dimensions {
 						}),
 						layout.Rigid(layout.Spacer{Width: unit.Dp(10)}.Layout),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							increaseButton := widget.Clickable{}
-							btn := material.Button(ui.theme, &increaseButton, "+")
+							btn := material.Button(ui.theme, &ui.increaseTests, "+")
 							dims := btn.Layout(gtx)
-							if increaseButton.Clicked() {
+							if ui.increaseTests.Clicked() {
 								if ui.config.TestsPerDomain < 10 {
 									ui.config.TestsPerDomain++
 								}
@@ -314,10 +326,9 @@ func (ui *UI) layoutConfig(gtx layout.Context) layout.Dimensions {
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							decreaseButton := widget.Clickable{}
-							btn := material.Button(ui.theme, &decreaseButton, "-")
+							btn := material.Button(ui.theme, &ui.decreaseTimeout, "-")
 							dims := btn.Layout(gtx)
-							if decreaseButton.Clicked() {
+							if ui.decreaseTimeout.Clicked() {
 								if ui.config.Timeout > time.Second {
 									ui.config.Timeout -= time.Second
 								}
@@ -326,10 +337,9 @@ func (ui *UI) layoutConfig(gtx layout.Context) layout.Dimensions {
 						}),
 						layout.Rigid(layout.Spacer{Width: unit.Dp(10)}.Layout),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							increaseButton := widget.Clickable{}
-							btn := material.Button(ui.theme, &increaseButton, "+")
+							btn := material.Button(ui.theme, &ui.increaseTimeout, "+")
 							dims := btn.Layout(gtx)
-							if increaseButton.Clicked() {
+							if ui.increaseTimeout.Clicked() {
 								if ui.config.Timeout < 10*time.Second {
 									ui.config.Timeout += time.Second
 								}
@@ -340,23 +350,20 @@ func (ui *UI) layoutConfig(gtx layout.Context) layout.Dimensions {
 				}),
 				layout.Rigid(layout.Spacer{Height: unit.Dp(20)}.Layout),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					tcpCheckbox := widget.Bool{Value: ui.config.UseTCP}
-					dims := material.CheckBox(ui.theme, &tcpCheckbox, "Use TCP for DNS queries").Layout(gtx)
-					ui.config.UseTCP = tcpCheckbox.Value
+					dims := material.CheckBox(ui.theme, &ui.useTCPCheckbox, "Use TCP for DNS queries").Layout(gtx)
+					ui.config.UseTCP = ui.useTCPCheckbox.Value
 					return dims
 				}),
 				layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					ipv6Checkbox := widget.Bool{Value: ui.config.UseIPv6}
-					dims := material.CheckBox(ui.theme, &ipv6Checkbox, "Use IPv6 when available").Layout(gtx)
-					ui.config.UseIPv6 = ipv6Checkbox.Value
+					dims := material.CheckBox(ui.theme, &ui.useIPv6Checkbox, "Use IPv6 when available").Layout(gtx)
+					ui.config.UseIPv6 = ui.useIPv6Checkbox.Value
 					return dims
 				}),
 				layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					parallelCheckbox := widget.Bool{Value: ui.config.ParallelTests}
-					dims := material.CheckBox(ui.theme, &parallelCheckbox, "Run tests in parallel").Layout(gtx)
-					ui.config.ParallelTests = parallelCheckbox.Value
+					dims := material.CheckBox(ui.theme, &ui.parallelCheckbox, "Run tests in parallel").Layout(gtx)
+					ui.config.ParallelTests = ui.parallelCheckbox.Value
 					return dims
 				}),
 			)
@@ -369,8 +376,20 @@ func (ui *UI) exportResults() {
 		return
 	}
 
-	file, err := os.Create(fmt.Sprintf("dns_test_results_%s.csv", 
-		time.Now().Format("2006-01-02_15-04-05")))
+	// Get user's Documents folder
+	userHomeDir, err := os.UserHomeDir()
+	if err != nil {
+		ui.errorLog = append(ui.errorLog, fmt.Sprintf("Failed to get user home directory: %v", err))
+		return
+	}
+	docsDir := filepath.Join(userHomeDir, "Documents")
+
+	// Create filename with timestamp
+	filename := fmt.Sprintf("dns_test_results_%s.csv", time.Now().Format("2006-01-02_15-04-05"))
+	filepath := filepath.Join(docsDir, filename)
+
+	// Create and write to file
+	file, err := os.Create(filepath)
 	if err != nil {
 		ui.errorLog = append(ui.errorLog, fmt.Sprintf("Failed to create file: %v", err))
 		return
@@ -398,6 +417,20 @@ func (ui *UI) exportResults() {
 			}
 		}
 	}
+
+	// Open the folder in explorer and highlight the file
+	go func() {
+		switch runtime.GOOS {
+		case "windows":
+			exec.Command("explorer", "/select,", filepath).Run()
+		case "darwin": // macOS
+			exec.Command("open", "-R", filepath).Run()
+		default: // Linux and others
+			exec.Command("xdg-open", docsDir).Run()
+		}
+	}()
+
+	ui.status = fmt.Sprintf("Results exported to %s", filepath)
 }
 
 func testProvider(provider DNSProvider, onProgress func(), testsPerDomain int, config TestConfig) (time.Duration, bool, int) {
