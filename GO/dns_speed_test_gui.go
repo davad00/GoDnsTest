@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"image/color"
 	"net"
@@ -73,6 +74,8 @@ type UI struct {
 	useTCPCheckbox widget.Bool
 	useIPv6Checkbox widget.Bool
 	parallelCheckbox widget.Bool
+	resultsList     widget.List
+	historyList     widget.List  // Add this for history scrolling
 }
 
 var (
@@ -122,9 +125,17 @@ func main() {
 			useTCPCheckbox:    widget.Bool{Value: false},
 			useIPv6Checkbox:   widget.Bool{Value: false},
 			parallelCheckbox:  widget.Bool{Value: true},
+			resultsList:      widget.List{List: layout.List{Axis: layout.Vertical}},
+			historyList:      widget.List{List: layout.List{Axis: layout.Vertical}}, // Initialize history list
 		}
 		ui.tabs.Value = "test"
 		ui.status = "Ready to test DNS servers"
+
+		// Load saved settings
+		if err := ui.loadSettings(); err != nil {
+			fmt.Printf("Failed to load settings: %v\n", err)
+		}
+
 		if err := ui.loop(); err != nil {
 			fmt.Printf("error: %v\n", err)
 		}
@@ -242,8 +253,12 @@ func (ui *UI) layoutTest(gtx layout.Context) layout.Dimensions {
 			return progressBar.Layout(gtx)
 		}),
 		layout.Rigid(layout.Spacer{Height: unit.Dp(20)}.Layout),
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return material.Body1(ui.theme, ui.results).Layout(gtx)
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			return layout.UniformInset(unit.Dp(10)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return material.List(ui.theme, &ui.resultsList).Layout(gtx, 1, func(gtx layout.Context, _ int) layout.Dimensions {
+					return material.Body1(ui.theme, ui.results).Layout(gtx)
+				})
+			})
 		}),
 	)
 }
@@ -255,35 +270,48 @@ func (ui *UI) layoutHistory(gtx layout.Context) layout.Dimensions {
 		}),
 		layout.Rigid(layout.Spacer{Height: unit.Dp(20)}.Layout),
 		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-			var children []layout.FlexChild
-			for i := len(ui.testHistory) - 1; i >= 0; i-- {
-				results := ui.testHistory[i]
-				if len(results) == 0 {
-					continue
-				}
-				timestamp := results[0].TimeStamp.Format("2006-01-02 15:04:05")
-				children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return material.Body1(ui.theme, fmt.Sprintf("\nTest Run: %s\n", timestamp)).Layout(gtx)
-				}))
-				for _, result := range results {
-					result := result
-					children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						text := fmt.Sprintf("%-20s: ", result.Provider.Name)
-						if result.Success {
-							text += fmt.Sprintf("%v", result.Latency)
-						} else {
-							text += "Failed"
+			return layout.UniformInset(unit.Dp(10)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return material.List(ui.theme, &ui.historyList).Layout(gtx, 1, func(gtx layout.Context, _ int) layout.Dimensions {
+					var children []layout.FlexChild
+					for i := len(ui.testHistory) - 1; i >= 0; i-- {
+						results := ui.testHistory[i]
+						if len(results) == 0 {
+							continue
 						}
-						return material.Body2(ui.theme, text).Layout(gtx)
-					}))
-				}
-			}
-			return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+						timestamp := results[0].TimeStamp.Format("2006-01-02 15:04:05")
+						children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return material.Body1(ui.theme, fmt.Sprintf("\nTest Run: %s\n", timestamp)).Layout(gtx)
+						}))
+						for _, result := range results {
+							result := result
+							children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								text := fmt.Sprintf("%-20s: ", result.Provider.Name)
+								if result.Success {
+									text += fmt.Sprintf("%v", result.Latency)
+								} else {
+									text += "Failed"
+								}
+								return material.Body2(ui.theme, text).Layout(gtx)
+							}))
+						}
+						children = append(children, layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout))
+					}
+					return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+				})
+			})
 		}),
 	)
 }
 
 func (ui *UI) layoutConfig(gtx layout.Context) layout.Dimensions {
+	// Save settings whenever they change
+	if ui.decreaseTests.Clicked() || ui.increaseTests.Clicked() ||
+		ui.decreaseTimeout.Clicked() || ui.increaseTimeout.Clicked() ||
+		ui.useTCPCheckbox.Changed() || ui.useIPv6Checkbox.Changed() ||
+		ui.parallelCheckbox.Changed() {
+		go ui.saveSettings()
+	}
+
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return material.H6(ui.theme, "Configuration").Layout(gtx)
@@ -557,11 +585,12 @@ func (ui *UI) runTests() {
 			return testResults[i].Latency < testResults[j].Latency
 		})
 
-		// Add to history
+		// Add to history and save settings
 		ui.testHistory = append(ui.testHistory, testResults)
 		if len(ui.testHistory) > 10 {
 			ui.testHistory = ui.testHistory[1:]
 		}
+		go ui.saveSettings() // Save settings after updating history
 
 		var resultText string
 		resultText = "DNS Provider Latency Results:\n"
@@ -582,4 +611,83 @@ func (ui *UI) runTests() {
 		ui.progress = 1.0
 		ui.window.Invalidate()
 	}()
+}
+
+// Update the saveSettings function
+func (ui *UI) saveSettings() error {
+	settings := struct {
+		TestsPerDomain int           `json:"tests_per_domain"`
+		Timeout        time.Duration `json:"timeout"`
+		UseTCP         bool          `json:"use_tcp"`
+		UseIPv6        bool          `json:"use_ipv6"`
+		ParallelTests  bool          `json:"parallel_tests"`
+		TestHistory   [][]TestResult `json:"test_history"`
+	}{
+		TestsPerDomain: ui.config.TestsPerDomain,
+		Timeout:        ui.config.Timeout,
+		UseTCP:         ui.config.UseTCP,
+		UseIPv6:        ui.config.UseIPv6,
+		ParallelTests:  ui.config.ParallelTests,
+		TestHistory:    ui.testHistory,
+	}
+
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return err
+	}
+
+	appDir := filepath.Join(configDir, "dns_speed_test")
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		return err
+	}
+
+	return os.WriteFile(filepath.Join(appDir, "settings.json"), data, 0644)
+}
+
+// Update the loadSettings function
+func (ui *UI) loadSettings() error {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return err
+	}
+
+	data, err := os.ReadFile(filepath.Join(configDir, "dns_speed_test", "settings.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // No settings file yet, use defaults
+		}
+		return err
+	}
+
+	var settings struct {
+		TestsPerDomain int           `json:"tests_per_domain"`
+		Timeout        time.Duration `json:"timeout"`
+		UseTCP         bool          `json:"use_tcp"`
+		UseIPv6        bool          `json:"use_ipv6"`
+		ParallelTests  bool          `json:"parallel_tests"`
+		TestHistory   [][]TestResult `json:"test_history"`
+	}
+
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return err
+	}
+
+	ui.config.TestsPerDomain = settings.TestsPerDomain
+	ui.config.Timeout = settings.Timeout
+	ui.config.UseTCP = settings.UseTCP
+	ui.config.UseIPv6 = settings.UseIPv6
+	ui.config.ParallelTests = settings.ParallelTests
+	ui.testHistory = settings.TestHistory
+
+	// Update UI controls to match loaded settings
+	ui.useTCPCheckbox.Value = settings.UseTCP
+	ui.useIPv6Checkbox.Value = settings.UseIPv6
+	ui.parallelCheckbox.Value = settings.ParallelTests
+
+	return nil
 } 
